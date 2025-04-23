@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <sched.h>
 
 // setup
 #define	INTERRUPT		iobase[1] + 0				// Badr1 + 0 : also ADC register
@@ -47,7 +48,9 @@
 
 #define	DEBUG			1
 #define VVAVE_FILE_MAGIC 	0x6429
-#define INTERVAL_NS		100000
+#define INTERVAL_NS		1000000
+#define MAX_SAFE_PRIORITY	(sched_get_priority_max(SCHED_FIFO) - 1)
+
 
 int badr[5];								// PCI 2.2 assigns 6 IO base addresses
 
@@ -97,7 +100,7 @@ void handle_sigint(int sig);
 void handle_sigalrm(int sig);
 void* monitor_dio(void* arg);
 void cleanup();
-void precise_sleep(long nanosecond);
+void precise_sleep_until(struct timespec *next);
 
 int main(int argc, char* argv[]){
 
@@ -113,10 +116,9 @@ int main(int argc, char* argv[]){
 	const char* flag;
 	const char* file_pathname;
 
-	timer_t timerid;
-	struct itimerspec its;
-	struct timespec rem;
-	struct timespec req;
+	struct sched_param param;
+	struct timespec next, start_time, end_time;
+	long elapsed_ms;
 
 // ====================  END OF MAIN LOCAL VARIABLE DECLARATION  ========================================
 
@@ -133,6 +135,8 @@ int main(int argc, char* argv[]){
 	read_adc->capacity = 0;
 
 	int_flag = 0;
+	param.sched_priority = MAX_SAFE_PRIORITY;
+
 // ====================  END OF MAIN VARIABLE INIT  ========================================
 
 
@@ -294,31 +298,21 @@ int main(int argc, char* argv[]){
 	}
 		// =====================  END OF PTHREAD INITIALIZATION  ======================
 
+	if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param)){
+		fprintf(stderr, "[ERROR] Failed to set sched priority\n");
+		fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
+		exit(1);
+	}
+
 		// =====================   CLOCK INITIALIZATION  ======================
 
-	if(timer_create(CLOCK_REALTIME, NULL, &timerid) < 0){
-		fprintf(stderr, "[ERROR] Failed to create timer\n");
-		fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
-		exit(1);				
-	}
-
-	its.it_value.tv_sec = 0;
-	its.it_value.tv_nsec = INTERVAL_NS;
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = INTERVAL_NS;
-
-	if(timer_settime(timerid, 0, &its, NULL) < 0){
-		fprintf(stderr, "[ERROR] Failed to set timer\n");
-		fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
-		exit(1);				
-	}
 
 		// =====================  END OF CLOCK INITIALIZATION  ======================
 
 	if(strcmp(flag, "-i") == 0){
-		while (i < 64){
+		while (i < 500){
 			adc_read(&adc_in_1, &adc_in_2);
-			if ( abs((unsigned int)adc_in_1_prev - (unsigned int)adc_in_1) > 100){
+			if ( abs((unsigned int)adc_in_1_prev - (unsigned int)adc_in_1) > 200){
 				buffer_write(adc_data, &adc_in_1, sizeof(uint16_t));
 				printf("inserted %d: %d: %d \n", i, (unsigned int)adc_in_1_prev, (unsigned int)adc_in_1);
 				adc_in_1_prev = adc_in_1;
@@ -345,25 +339,55 @@ int main(int argc, char* argv[]){
 			i++;
 		}
 		if(int_flag == 0){
-			printf("[INFO] SAVING . . . . . .\n");
-			printf("[INFO] Data saved successfully\n");
+			printf("[INFO] Data extracted successfully\n");
 		} else {
 			printf("\n[INFO] Interrupt signal triggered . . . . . . \n");
 		}
 	}else if(strcmp(flag, "-w") == 0){
 		count = read_adc->size/sizeof(read_adc->data[0]);
+
+		out16(DA_CTLREG,0x0a43);			// DA Enable, #1, #1, SW 5V unipolar		2/6
+
 		printf("%u\n", (unsigned int)count);
 		printf("[INFO] Data loaded successfully\n");
 		printf("[INFO] Sending data to dac . . . . . . \n");
+
+		if(clock_gettime(CLOCK_MONOTONIC, &next)){
+			fprintf(stderr, "clock_gettime failed\n");
+			fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
+			exit(1);
+		}
+		if(clock_gettime(CLOCK_MONOTONIC, &start_time)){
+			fprintf(stderr, "clock_gettime failed\n");
+			fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
+			exit(1);
+		}
+		next = start_time;
+
 		while(1){
 
 			for(i=0; i<count; ++i){
 				buffer_read(read_adc, (size_t)i,&data_to_scr); 
 				dac(&data_to_scr);
-				//precise_sleep(INTERVAL_NS);
-				usleep(1);
+				next.tv_nsec += INTERVAL_NS;
+
+				if(next.tv_nsec >= 1000000000){
+					next.tv_nsec -= 1000000000;
+					next.tv_sec += 1;
+				}
+				precise_sleep_until(&next);
+				if(clock_gettime(CLOCK_MONOTONIC, &end_time)){
+					fprintf(stderr, "clock_gettime failed\n");
+					fprintf(stderr, "[ERROR] Error code: %s\n", strerror(errno)); 
+					exit(1);
+				}
+	
+				elapsed_ms = (end_time.tv_sec - start_time.tv_sec)*1000000 + (end_time.tv_nsec - start_time.tv_nsec)/1000;
+	
+				printf("[DEBUG] Time taken %d:  %ld\n", i,elapsed_ms);
 			} 		
 			i = 0;	
+
 			if(int_flag != 0){
 				printf("\n[INFO] Interrupt signal triggered . . . . . . \n");
 				break;
@@ -418,6 +442,7 @@ void adc_read(uint16_t *adc_in_1, uint16_t *adc_in_2){
 			count++;
 			delay(5);
 		}
+		debounce_flag = 0;
 		return;
 	}
 	debounce_flag = 1;
@@ -436,12 +461,12 @@ void dio(uintptr_t *dio_in){
 
 void dac(uint16_t *data){
 	//for(i=0x8fff;i<0xffff;i=i+0x80) {
-		out16(DA_CTLREG,0x0a23);			// DA Enable, #0, #1, SW 5V unipolar		2/6
-		out16(DA_FIFOCLR, 0);					// Clear DA FIFO  buffer
+		//out16(DA_CTLREG,0x0a23);			// DA Enable, #0, #1, SW 5V unipolar		2/6
+		//out16(DA_FIFOCLR, 0);					// Clear DA FIFO  buffer
+		//out16(DA_Data,(short) *data);																																		
+		//out16(DA_CTLREG,0x0a43);			// DA Enable, #1, #1, SW 5V unipolar		2/6
 		out16(DA_Data,(short) *data);																																		
-		out16(DA_CTLREG,0x0a43);			// DA Enable, #1, #1, SW 5V unipolar		2/6
 		out16(DA_FIFOCLR, 0);					// Clear DA FIFO  buffer
-		out16(DA_Data,(short) *data);																																		
 
 		//printf("DAC Data [%4x]: %4x\r", i, i);		// print DAC													
 		//fflush( stdout ); 
@@ -580,7 +605,12 @@ void adc_save_file(Buffer *buffer, const char* file_path){
 		exit(1);
 	}
 
-	fwrite(buffer->data,buffer->size,1,f);
+	fwrite(buffer->data, buffer->size, 1, f);
+	if(ferror(f)){
+		fprintf(stderr, "ERROR: Could not write to file '%s':%s\n", file_path, strerror(errno));
+		exit(1);
+	}
+
 	if(ferror(f)){
 		fprintf(stderr, "ERROR: Could not write to file '%s':%s\n", file_path, strerror(errno));
 		exit(1);
@@ -592,14 +622,18 @@ void adc_save_file(Buffer *buffer, const char* file_path){
 void cleanup(){
 	buffer_free(read_adc_ptr);
 	buffer_free(adc_data_ptr);
-	printf("[INFO] EXIT SUCCESS\n");
+	printf("\n[INFO] EXIT SUCCESS\n");
 
 }
-void precise_sleep(long nanosecond){
-	struct timespec req, rem;
-	req.tv_sec = 0;
-	req.tv_nsec = nanosecond;
-	clock_nanosleep(CLOCK_MONOTONIC,0, &req, &rem);
+void precise_sleep_until(struct timespec *next){
+	int ret;
+	ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next, NULL);
+	if(ret < 0){
+		if(errno != ENOENT){
+			fprintf(stderr, "[ERROR] Exited with non-interrupt condition\n[ERROR] clock_nanosleep failed\n[ERROR] Err: %s\n", strerror(errno));
+		}
+		exit(1);
+	}
 }
 void handle_sigtstp(int sig){
 	printf("[INFO] Stop not allowed\n");

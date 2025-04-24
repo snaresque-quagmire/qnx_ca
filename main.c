@@ -625,7 +625,7 @@ void create_wave()
         }
         break;
     default:
-        printf("oi read la");
+        printf("Invalid wave type.");
         break;
     }
 }
